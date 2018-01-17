@@ -2,10 +2,8 @@ package com.template
 
 import co.paralleluniverse.fibers.Suspendable
 import net.corda.core.contracts.Command
-import net.corda.core.flows.FinalityFlow
-import net.corda.core.flows.FlowLogic
-import net.corda.core.flows.InitiatingFlow
-import net.corda.core.flows.StartableByRPC
+import net.corda.core.contracts.StateAndContract
+import net.corda.core.flows.*
 import net.corda.core.identity.Party
 import net.corda.core.messaging.CordaRPCOps
 import net.corda.core.serialization.SerializationWhitelist
@@ -18,6 +16,8 @@ import javax.ws.rs.Path
 import javax.ws.rs.Produces
 import javax.ws.rs.core.MediaType
 import javax.ws.rs.core.Response
+import net.corda.core.contracts.requireThat
+import net.corda.core.transactions.SignedTransaction
 
 // *****************
 // * API Endpoints *
@@ -50,20 +50,49 @@ class IOUFlow(val iouValue: Int,
         // We retrieve the notary identity from the network map.
         val notary = serviceHub.networkMapCache.notaryIdentities[0]
 
+        // We create a transaction builder.
+        val txBuilder = TransactionBuilder(notary = notary)
+
         // We create the transaction components.
         val outputState = IOUState(iouValue, ourIdentity, otherParty)
-        val cmd = Command(TemplateContract.Commands.Action(), ourIdentity.owningKey)
+        val outputContractAndState = StateAndContract(outputState, IOU_CONTRACT_ID)
+        val cmd = Command(IOUContract.Create(), listOf(ourIdentity.owningKey, otherParty.owningKey))
 
-        // We create a transaction builder and add the components.
-        val txBuilder = TransactionBuilder(notary = notary)
-                .addOutputState(outputState, TEMPLATE_CONTRACT_ID)
-                .addCommand(cmd)
+        // We add the items to the builder.
+        txBuilder.withItems(outputContractAndState, cmd)
 
-        // We sign the transaction.
+        // Verifying the transaction.
+        txBuilder.verify(serviceHub)
+
+        // Signing the transaction.
         val signedTx = serviceHub.signInitialTransaction(txBuilder)
 
-        // We finalise the transaction.
-        subFlow(FinalityFlow(signedTx))
+        // Creating a session with the other party.
+        val otherpartySession = initiateFlow(otherParty)
+
+        // Obtaining the counterparty's signature.
+        val fullySignedTx = subFlow(CollectSignaturesFlow(signedTx, listOf(otherpartySession), CollectSignaturesFlow.tracker()))
+
+        // Finalising the transaction.
+        subFlow(FinalityFlow(fullySignedTx))
+    }
+}
+
+// Define IOUFlowResponder:
+@InitiatedBy(IOUFlow::class)
+class IOUFlowResponder(val otherPartySession: FlowSession) : FlowLogic<Unit>() {
+    @Suspendable
+    override fun call() {
+        val signTransactionFlow = object : SignTransactionFlow(otherPartySession, SignTransactionFlow.tracker()) {
+            override fun checkTransaction(stx: SignedTransaction) = requireThat {
+                val output = stx.tx.outputs.single().data
+                "This must be an IOU transaction." using (output is IOUState)
+                val iou = output as IOUState
+                "The IOU's value can't be too high." using (iou.value < 100)
+            }
+        }
+
+        subFlow(signTransactionFlow)
     }
 }
 
